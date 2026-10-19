@@ -1,0 +1,5 @@
+plumb-xrpl
+Copyright 2026 Plumb Data
+
+Extracted from Plumb (verified-reads), the payment-proof layer of the Plumb Data Exchange.
+Licensed under the Apache License, Version 2.0.

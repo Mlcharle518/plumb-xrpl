@@ -1,0 +1,43 @@
+[project]
+name = "plumb-xrpl"
+version = "0.1.0"
+description = "XRP Ledger transactions and payments proven without trusting any server: pinned validator list -> quorum-signed ledger -> hash links -> rebuilt transaction tree."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+authors = [{ name = "Plumb Data" }]
+keywords = ["xrpl", "xrp", "rlusd", "payments", "proof", "verification", "x402", "agents", "light-client"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Security :: Cryptography",
+  "Topic :: Office/Business :: Financial",
+]
+# xrpl-py decodes bytes only (every hash and signature is checked here); coincurve = secp256k1; cryptography = ed25519.
+dependencies = ["xrpl-py>=5.2", "coincurve>=20", "cryptography>=42", "websockets>=13"]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.20"]
+test = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/Mlcharle518/plumb-xrpl"
+Issues = "https://github.com/Mlcharle518/plumb-xrpl/issues"
+
+[project.scripts]
+plumb-xrpl = "plumb_xrpl.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["plumb_xrpl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
