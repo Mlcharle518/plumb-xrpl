@@ -1,8 +1,8 @@
-# While this repository is PRIVATE, hosted runners are metered and the owner has no minutes left this month, so tests run
-# locally (python -m pytest -q) and this workflow is manual. When the repo goes public (Actions are free there), restore:
-#   on: { push: { branches: [main] }, pull_request: }
 name: tests
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 jobs:
   test:
