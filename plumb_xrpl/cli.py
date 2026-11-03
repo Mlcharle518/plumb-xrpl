@@ -29,6 +29,13 @@ def cmd_record(a: argparse.Namespace) -> None:
     X.record(every=a.every)
 
 
+def cmd_lists(a: argparse.Namespace) -> None:
+    from pathlib import Path
+    arc = X.Archive()
+    _print(arc.list_report() if a.report_only and not a.adopt else
+           X.adopt_lists(arc, [Path(p) for p in a.adopt] if a.adopt else None))
+
+
 def cmd_serve(_a: argparse.Namespace) -> None:
     try:
         from .server import main as serve
@@ -56,6 +63,11 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("record", help="keep validator-quorum proofs so payments older than the live stream stay provable")
     p.add_argument("--every", type=int, default=X.ARCHIVE_EVERY)
     p.set_defaults(fn=cmd_record)
+    p = sub.add_parser("lists", help="which validator lists the proof archive was recorded under; adopt verifiable list "
+                                     "documents from disk (default: this machine's validator-list cache)")
+    p.add_argument("--adopt", action="append", default=[], help="a list document or validator-list cache file to verify and keep")
+    p.add_argument("--report-only", action="store_true")
+    p.set_defaults(fn=cmd_lists)
     sub.add_parser("serve", help="MCP server over stdio (extra: plumb-xrpl[mcp])").set_defaults(fn=cmd_serve)
     a = ap.parse_args(argv)
     a.fn(a)

@@ -19,15 +19,24 @@ Validator signatures exist only live (servers do not keep them), so a quorum pro
 payments: walk back from a ledger signed now) or from the proof archive (`plumb-xrpl record` keeps one quorum proof per
 256 ledgers). A payment older than both is reported unverifiable, never guessed.
 
+An archived proof is checked against the validator list that was IN FORCE when it was signed, not today's: the recorder
+keeps every list document it records under (publisher manifest + blob + signature + the validator manifests it used),
+keyed by list sequence, beside the archive. That list is re-verified end to end against the pinned publisher key, and it
+must have been valid at the proof ledger's close time (not expired, effective, not superseded by a newer list held by
+then). Ripple publishes new lists from time to time; validations signed under the old one are not forgeries.
+
 Amounts are raw integers: XRP in drops; issued currencies (RLUSD...) in millionths (value x 10^6, rounded down).
 """
 from __future__ import annotations
 
 import asyncio
 import base64
+import bisect
 import hashlib
 import json
 import os
+import re
+import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -145,18 +154,32 @@ class Unl:
         return True
 
 
-def load_unl(doc: dict, now: float | None = None) -> Unl:
-    """Verify a vl.ripple.com document end to end against the pinned publisher key."""
-    pub = parse_manifest(base64.b64decode(doc["manifest"]))
+def verify_doc(doc: dict) -> dict:
+    """The decoded blob of a vl.ripple.com document whose publisher manifest is signed by the PINNED publisher key and
+    whose blob is signed by that publisher's signing key. Time is not checked here (see load_unl)."""
+    try:
+        pub = parse_manifest(base64.b64decode(doc["manifest"]))
+        blob = base64.b64decode(doc["blob"])
+        sig = bytes.fromhex(doc["signature"])
+    except (KeyError, TypeError, ValueError) as e:
+        raise XrplError(f"validator list document is malformed ({type(e).__name__})") from None
     if pub.master != PUBLISHER_KEY:
         raise XrplError("validator list is not from the pinned publisher")
-    blob = base64.b64decode(doc["blob"])
-    if not pub.ephemeral or not verify_sig(pub.ephemeral, blob, bytes.fromhex(doc["signature"])):
+    if not pub.ephemeral or not verify_sig(pub.ephemeral, blob, sig):
         raise XrplError("validator list signature does not verify")
-    b = json.loads(blob)
+    return json.loads(blob)
+
+
+def load_unl(doc: dict, now: float | None = None) -> Unl:
+    """Verify a vl.ripple.com document end to end against the pinned publisher key, valid at `now` (default: the
+    current time; for an archived proof: the proof ledger's close time)."""
+    b = verify_doc(doc)
+    t = time.time() if now is None else now
     expires = int(b["expiration"]) + RIPPLE_EPOCH
-    if (now or time.time()) >= expires:
+    if t >= expires:
         raise XrplError("validator list has expired")
+    if "effective" in b and t < int(b["effective"]) + RIPPLE_EPOCH:
+        raise XrplError("validator list was not yet effective")
     unl = Unl({}, set(), int(b["sequence"]), expires)
     for v in b["validators"]:
         m = parse_manifest(base64.b64decode(v["manifest"]))
@@ -361,11 +384,140 @@ def node_public_b58(key_hex: str) -> str:
 
 # --- the proof archive -----------------------------------------------------------------------------------------------
 
-class Archive:
-    """Quorum proofs kept from the live stream (one per ARCHIVE_EVERY ledgers), so older payments stay provable."""
+SUPERSEDE_GRACE_S = 2 * 86400   # the recorder refreshes its list daily: an old list stays acceptable this long after a newer one is held
 
-    def __init__(self, path: Path | None = None):
-        self.path = path or Path(os.environ.get("VR_XRPL_ARCHIVE", Path.home() / ".verified-reads" / "xrpl-proofs.jsonl"))
+
+def _manifest_set_id(raws: dict[str, bytes]) -> str:
+    body = json.dumps(sorted((m.upper(), base64.b64encode(r).decode()) for m, r in raws.items()))
+    return hashlib.sha256(body.encode()).hexdigest()[:16]
+
+
+class ListLibrary:
+    """Every validator-list document the archive was recorded under, by list sequence (<dir>/<seq>.json):
+    {"sequence", "doc" (vl.ripple.com: public_key, manifest, blob, signature), "first_seen" (unix), "manifest_sets"
+    {id: {master: raw manifest b64}}}. A file only saves fetching, never checking: every use re-verifies the document
+    against the pinned publisher key and every manifest against its validator's master key. A document that does not
+    verify is never stored."""
+
+    def __init__(self, root: Path):
+        self.root = Path(root)
+
+    def _file(self, seq: int) -> Path:
+        return self.root / f"{int(seq)}.json"
+
+    def get(self, seq: int) -> dict | None:
+        try:
+            return json.loads(self._file(seq).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    def sequences(self) -> list[int]:
+        try:
+            return sorted(int(p.stem) for p in self.root.glob("*.json") if p.stem.isdigit())
+        except OSError:
+            return []
+
+    def save(self, doc: dict, raws: dict[str, bytes] | None = None, seen_at: float | None = None) -> tuple[int, str]:
+        """Keep a verified list document and the validator manifests used with it. Returns (sequence, manifest set id).
+        Raises XrplError for a document that does not verify against the pinned publisher."""
+        b = verify_doc(doc)
+        seq, listed = int(b["sequence"]), {v["validation_public_key"].upper() for v in b["validators"]}
+        good = {}
+        for r in (raws or {}).values():                  # only manifests that verify, of validators on this list
+            try:
+                man = parse_manifest(r)
+            except XrplError:
+                continue
+            if man.master in listed:
+                good[man.master] = r
+        sid = _manifest_set_id(good)
+        seen = float(time.time() if seen_at is None else seen_at)
+        cur = self.get(seq) or {}
+        if cur.get("doc") and cur["doc"] != doc:
+            try:
+                verify_doc(cur["doc"])
+                doc = cur["doc"]                         # the same signed list already held: keep that copy
+            except (XrplError, KeyError, TypeError):
+                cur = {}                                 # a damaged file is replaced by the verified document
+        sets = dict(cur.get("manifest_sets") or {})
+        first = min(float(cur.get("first_seen", seen)), seen)
+        if cur.get("doc") == doc and sid in sets and float(cur.get("first_seen", -1)) == first:
+            return seq, sid                              # nothing new
+        sets[sid] = {m: base64.b64encode(r).decode() for m, r in sorted(good.items())}
+        out = {"sequence": seq, "doc": doc, "first_seen": first, "manifest_sets": sets}
+        self.root.mkdir(parents=True, exist_ok=True)
+        tmp = self._file(seq).with_suffix(f".tmp{os.getpid()}")
+        tmp.write_text(json.dumps(out), encoding="utf-8")
+        os.replace(tmp, self._file(seq))
+        return seq, sid
+
+    def adopt(self, path: Path) -> tuple[int, str]:
+        """Backfill from a file on disk: a UNL cache ({fetched, doc, manifests}), a library file, or a bare
+        vl.ripple.com document. Verified before it is kept; XrplError otherwise."""
+        try:
+            c = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise XrplError(f"{path}: not readable JSON ({type(e).__name__})") from None
+        if not isinstance(c, dict):
+            raise XrplError(f"{path}: not a validator-list document")
+        if "blob" in c and "manifest" in c:
+            return self.save(c, {}, None)
+        if "manifest_sets" in c and "doc" in c:
+            out = self.save(c["doc"], {}, c.get("first_seen"))
+            for ms in c["manifest_sets"].values():
+                out = self.save(c["doc"], {m: base64.b64decode(r) for m, r in ms.items()}, c.get("first_seen"))
+            return out
+        if "doc" in c:
+            return self.save(c["doc"], {m: base64.b64decode(r) for m, r in (c.get("manifests") or {}).items()},
+                             c.get("fetched"))
+        raise XrplError(f"{path}: not a validator-list document")
+
+
+def _proof_seq(proof: dict) -> int | None:
+    s = proof.get("vl_seq", proof.get("unl_sequence"))     # unl_sequence: archives recorded before vl_seq existed
+    return int(s) if s is not None else None
+
+
+class Archive:
+    """Quorum proofs kept from the live stream (one per ARCHIVE_EVERY ledgers), so older payments stay provable.
+    Read through an index of (ledger index, byte offset), refreshed incrementally as the recorder appends, so a proof
+    never re-parses the whole file. Beside it, `lists` holds the validator-list documents the proofs were recorded under."""
+
+    def __init__(self, path: Path | None = None, lists: Path | None = None):
+        self.path = Path(path or os.environ.get("VR_XRPL_ARCHIVE", Path.home() / ".verified-reads" / "xrpl-proofs.jsonl"))
+        self.lists = ListLibrary(lists or self.path.parent / f"{self.path.stem}-lists")
+        self._idx: list[tuple[int, int]] = []
+        self._size = 0
+        self._lock = threading.Lock()
+
+    def _refresh(self) -> None:
+        try:
+            size = self.path.stat().st_size
+        except OSError:
+            self._idx, self._size = [], 0
+            return
+        if size == self._size:
+            return
+        if size < self._size:                                 # replaced or truncated: start over
+            self._idx, self._size = [], 0
+        new = []
+        with open(self.path, "rb") as fh:
+            fh.seek(self._size)
+            pos = self._size
+            for raw in fh:
+                if not raw.endswith(b"\n"):
+                    break                                     # a line still being written
+                m = re.match(rb'\{"ledger_index":\s*(\d+)', raw)
+                if m:
+                    new.append((int(m.group(1)), pos))
+                elif raw.strip():
+                    try:
+                        new.append((int(json.loads(raw)["ledger_index"]), pos))
+                    except (ValueError, KeyError, TypeError):
+                        pass
+                pos += len(raw)
+        self._size = pos
+        self._idx = sorted(self._idx + new)
 
     def proofs(self) -> list[dict]:
         if not self.path.exists():
@@ -377,30 +529,89 @@ class Archive:
         with open(self.path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(proof) + "\n")
 
+    def bounds(self) -> tuple[int, int] | None:
+        """(oldest, newest) archived proof ledger, or None for an empty archive."""
+        with self._lock:
+            self._refresh()
+            return (self._idx[0][0], self._idx[-1][0]) if self._idx else None
+
+    def oldest(self) -> int | None:
+        """The oldest archived proof ledger: nothing much older than this is provable from the archive."""
+        b = self.bounds()
+        return b[0] if b else None
+
     def covering(self, index: int) -> dict | None:
         """The nearest archived proof at or after `index` within walking distance."""
-        best = None
+        with self._lock:
+            self._refresh()
+            i = bisect.bisect_left(self._idx, (index, -1))
+            hit = self._idx[i] if i < len(self._idx) and self._idx[i][0] <= index + MAX_WALK else None
+        if hit is None:
+            return None
+        with open(self.path, "rb") as fh:
+            fh.seek(hit[1])
+            return json.loads(fh.readline())
+
+    def save_list(self, doc: dict, raws: dict[str, bytes] | None = None, seen_at: float | None = None) -> tuple[int, str]:
+        return self.lists.save(doc, raws, seen_at)
+
+    def list_report(self) -> dict:
+        """Per list sequence the archive references: how many proofs, and whether a verified document is held."""
+        refs: dict[int | None, list[int]] = {}
         for p in self.proofs():
-            if index <= p["ledger_index"] <= index + MAX_WALK and (best is None or p["ledger_index"] < best["ledger_index"]):
-                best = p
-        return best
+            refs.setdefault(_proof_seq(p), []).append(p["ledger_index"])
+        out = {}
+        for seq, idx in sorted(refs.items(), key=lambda kv: (kv[0] is None, kv[0] or 0)):
+            row: dict = {"proofs": len(idx), "ledgers": [min(idx), max(idx)]}
+            saved = self.lists.get(seq) if seq is not None else None
+            if seq is None:
+                row["list"] = "NOT NAMED by these proofs: they cannot be checked"
+            elif saved is None:
+                row["list"] = "NOT HELD: these proofs cannot be checked until a verifiable document for this sequence is adopted"
+            else:
+                try:
+                    verify_doc(saved["doc"])
+                    row.update(list="held; verifies against the pinned publisher",
+                               manifest_sets=len(saved.get("manifest_sets") or {}), first_seen=saved.get("first_seen"))
+                except (XrplError, KeyError) as e:
+                    row["list"] = f"held but REFUSED: {e}"
+            out[str(seq)] = row
+        return {"archive": str(self.path), "lists_dir": str(self.lists.root), "bounds": self.bounds(), "by_list": out}
+
+
+def adopt_lists(archive: Archive, paths: list[Path] | None = None) -> dict:
+    """Backfill the archive's list library from documents already on disk (default: this machine's UNL cache), each
+    verified against the pinned publisher before it is kept, then report which archived proofs have their list."""
+    if paths is None:
+        paths = [Path(os.environ.get("VR_XRPL_UNL_CACHE", Path.home() / ".verified-reads" / "xrpl-unl.json"))]
+    adopted = []
+    for p in paths:
+        try:
+            seq, sid = archive.lists.adopt(Path(p))
+            adopted.append({"file": str(p), "adopted": True, "vl_seq": seq, "manifest_set": sid})
+        except XrplError as e:
+            adopted.append({"file": str(p), "adopted": False, "reason": str(e)})
+    return {"adopt": adopted, **archive.list_report()}
 
 
 def record(source: Source | None = None, archive: Archive | None = None, every: int = ARCHIVE_EVERY) -> None:
     """Run forever: keep a quorum proof for every `every`-th ledger (and refresh the validator list daily)."""
     source, archive = source or Source(), archive or Archive()
-    unl, loaded, last = None, 0.0, 0
+    unl, loaded, last, sid = None, 0.0, 0, None
     while True:
         if unl is None or time.time() - loaded > 86400:
-            unl, loaded = load_unl(source.unl_doc()), time.time()
-            refresh_rotations(unl, source)
+            doc = source.unl_doc()
+            unl, loaded = load_unl(doc), time.time()
+            raws = refresh_rotations(unl, source)
+            _, sid = archive.save_list(doc, raws, loaded)   # the exact list + keys these proofs will be checked against
         try:
             head = int(source.rpc("ledger", {"ledger_index": "validated"})["ledger_index"])
             target = max((head // every + 1) * every, (last // every + 1) * every)   # never the same boundary twice
             p = source.live_validations(target, unl, timeout_s=every * 5)
             last = p["ledger_index"]
             signed = quorum_of(unl, p["validations"], p["ledger_hash"])
-            archive.add({**p, "unl_sequence": unl.sequence, "signed": len(signed), "of": len(unl.masters), "at": int(time.time())})
+            archive.add({**p, "unl_sequence": unl.sequence, "vl_seq": unl.sequence, "vl_manifests": sid,
+                         "signed": len(signed), "of": len(unl.masters), "at": int(time.time())})
             print(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} kept ledger {p['ledger_index']} "
                   f"({len(signed)}/{len(unl.masters)} validators)", flush=True)
         except Exception as e:  # noqa: BLE001 - keep recording
@@ -426,22 +637,35 @@ def refresh_rotations(unl: Unl, source: Source, raws: dict[str, bytes] | None = 
 UNL_CACHE_S = 3600
 
 
-def cached_unl(source: Source, cache: Path | None = None, now: float | None = None) -> Unl:
+def _keep(lists: "ListLibrary | None", doc: dict, raws: dict[str, bytes], seen_at: float) -> None:
+    if lists is not None:
+        try:
+            lists.save(doc, raws, seen_at)
+        except (OSError, XrplError):
+            pass
+
+
+def cached_unl(source: Source, cache: Path | None = None, now: float | None = None,
+               lists: ListLibrary | None = None) -> Unl:
     """The validator list, from a one-hour disk cache of the RAW signed documents. Everything is re-verified on load
-    (pinned publisher, list signature, every manifest), so the cache saves fetching, never checking."""
+    (pinned publisher, list signature, every manifest), so the cache saves fetching, never checking. With `lists`, the
+    current document is also kept there by sequence, so proofs archived under it stay checkable after it is replaced."""
     cache = cache or Path(os.environ.get("VR_XRPL_UNL_CACHE", Path.home() / ".verified-reads" / "xrpl-unl.json"))
     now = now or time.time()
     try:
         c = json.loads(cache.read_text(encoding="utf-8"))
         if now - c["fetched"] < UNL_CACHE_S:
             unl = load_unl(c["doc"], now)
-            refresh_rotations(unl, source, {m: base64.b64decode(r) for m, r in c["manifests"].items()})
+            raws = {m: base64.b64decode(r) for m, r in c["manifests"].items()}
+            refresh_rotations(unl, source, raws)
+            _keep(lists, c["doc"], raws, c["fetched"])
             return unl
     except (OSError, ValueError, KeyError, XrplError):
         pass
     doc = source.unl_doc()
     unl = load_unl(doc, now)
     raws = refresh_rotations(unl, source)
+    _keep(lists, doc, raws, now)
     try:
         cache.parent.mkdir(parents=True, exist_ok=True)
         cache.write_text(json.dumps({"fetched": now, "doc": doc, "manifests": {m: base64.b64encode(r).decode() for m, r in raws.items()}}),
@@ -520,24 +744,77 @@ class XrplHistory:
 
     def unl(self) -> Unl:
         if self._unl is None or time.time() - self._unl_at > UNL_CACHE_S:
-            self._unl = cached_unl(self.source, self.unl_cache)
+            self._unl = cached_unl(self.source, self.unl_cache, lists=self.archive.lists)
             self._unl_at = time.time()
         return self._unl
 
+    def list_in_force(self, proof: dict, at: int) -> tuple[Unl, set[str], str]:
+        """(list, validators that signed, manifest set id) for an ARCHIVED proof: the list it was recorded under,
+        re-verified end to end, valid at `at` (the proof ledger's close time, not now) and not superseded by then."""
+        seq = _proof_seq(proof)
+        if seq is None:
+            raise XrplError("the archived proof does not name the validator list it was recorded under; cannot tell "
+                            "which list was in force")
+        saved = self.archive.lists.get(seq)
+        if not saved or "doc" not in saved:
+            raise XrplError(f"the archived proof was recorded under validator list seq {seq}, which is not held in "
+                            f"{self.archive.lists.root} (adopt a verifiable copy: `plumb-xrpl lists --adopt FILE`); "
+                            "cannot prove it")
+        try:
+            load_unl(saved["doc"], at)
+        except XrplError as e:
+            raise XrplError(f"validator list seq {seq} was not valid when ledger {proof['ledger_index']} closed: {e}") from None
+        for s in self.archive.lists.sequences():
+            newer = self.archive.lists.get(s) if s > seq else None
+            if newer and float(newer.get("first_seen", float("inf"))) + SUPERSEDE_GRACE_S <= at:
+                try:
+                    verify_doc(newer["doc"])
+                except (XrplError, KeyError, TypeError):
+                    continue                                # an unverifiable file supersedes nothing
+                raise XrplError(f"validator list seq {seq} was no longer in force when ledger {proof['ledger_index']} "
+                                f"closed: seq {s} had replaced it")
+        sets = dict(saved.get("manifest_sets") or {})
+        order = [proof["vl_manifests"]] if proof.get("vl_manifests") in sets else []
+        order += [k for k in sets if k not in order] + [""]     # "": only the manifests inside the list itself
+        best: tuple[Unl, set[str], str] | None = None
+        for sid in order:                                       # each set is a verified key state of THIS list
+            unl = load_unl(saved["doc"], at)
+            refresh_rotations(unl, self.source, {m: base64.b64decode(r) for m, r in sets.get(sid, {}).items()})
+            signed = quorum_of(unl, proof["validations"], proof["ledger_hash"])
+            if best is None or len(signed) > len(best[1]):
+                best = (unl, signed, sid)
+            if len(signed) >= unl.quorum:
+                break
+        return best
+
     def proven_header(self, index: int) -> tuple[Header, dict]:
-        """The header of ledger `index`, proven by a quorum-signed ledger at or after it plus hash links."""
-        unl = self.unl()
+        """The header of ledger `index`, proven by a quorum-signed ledger at or after it plus hash links. A live proof
+        is checked against the current validator list; an archived one against the list in force when it was signed."""
         proof = self.archive.covering(index)
-        if proof is None:
+        archived = proof is not None
+        if archived:
+            try:
+                self.unl()                 # keeps the current list in the library; the archived proof does not depend on it
+            except Exception:  # noqa: BLE001 - offline / current list unavailable: the archived list decides
+                pass
+            top = proof["ledger_index"]
+            top_h = parse_header(self.source.header(top))
+            if top_h.index != top or top_h.hash != str(proof["ledger_hash"]).upper():
+                raise XrplError(f"header {top} does not hash to the proven link")
+            unl, signed, sid = self.list_in_force(proof, top_h.close_time)
+        else:
+            unl = self.unl()
             head = int(self.source.rpc("ledger", {"ledger_index": "validated"})["ledger_index"])
             if head - index > MAX_WALK:
                 raise XrplError(f"ledger {index} is older than the proof archive and {MAX_WALK} ledgers of walking "
                                 "(run `plumb-xrpl record` to keep proofs); cannot prove it")
             proof = self.source.live_validations(index, unl)
-        signed = quorum_of(unl, proof["validations"], proof["ledger_hash"])
+            top, sid = proof["ledger_index"], None
+            signed = quorum_of(unl, proof["validations"], proof["ledger_hash"])
         if len(signed) < unl.quorum:
-            raise XrplError(f"only {len(signed)} of {len(unl.masters)} listed validators signed the proof ledger (need {unl.quorum})")
-        top = proof["ledger_index"]
+            where = f" on validator list seq {unl.sequence}, the list it was recorded under" if archived else ""
+            raise XrplError(f"only {len(signed)} of {len(unl.masters)} listed validators signed the proof ledger{where} "
+                            f"(need {unl.quorum})")
         with ThreadPoolExecutor(8) as ex:
             raws = dict(zip(range(index, top + 1), ex.map(self.source.header, range(index, top + 1))))
         expect = proof["ledger_hash"]
@@ -547,8 +824,12 @@ class XrplHistory:
             if h.index != i or h.hash != expect:
                 raise XrplError(f"header {i} does not hash to the proven link")
             expect = h.parent
-        return h, {"proof_ledger": top, "proof_hash": proof["ledger_hash"], "validators": len(signed), "of": len(unl.masters),
-                   "quorum": unl.quorum, "unl_sequence": unl.sequence, "walked": top - index, "from_archive": "at" in proof}
+        how = {"proof_ledger": top, "proof_hash": proof["ledger_hash"], "validators": len(signed), "of": len(unl.masters),
+               "quorum": unl.quorum, "unl_sequence": unl.sequence, "vl_seq": unl.sequence, "walked": top - index,
+               "from_archive": archived}
+        if archived:
+            how.update(vl_checked_at=top_h.close_time, vl_manifests=sid or "list")
+        return h, how
 
     def proven_tx(self, tx_hash: str) -> tuple[dict, dict, int, Header, dict]:
         """(tx, metadata, ledger index, proven header, how) for a transaction in a validated ledger: the tx and its
@@ -609,5 +890,7 @@ def envelope(fn) -> dict:
         return {"verified": False, "reason": f"{type(e).__name__}: {e}"[:300]}
     x = v["xrpl"]
     return {"verified": True, "value": v, "anchor": {"root": x["proof_hash"], "source":
-            f"XRPL validator list (vl.ripple.com seq {x['unl_sequence']}, pinned publisher {PUBLISHER_KEY[:10]}...): "
+            f"XRPL validator list (vl.ripple.com seq {x['unl_sequence']}"
+            f"{', in force when the archived proof ledger closed' if x.get('from_archive') else ''}, "
+            f"pinned publisher {PUBLISHER_KEY[:10]}...): "
             f"{x['validators']}/{x['of']} validator signatures on ledger {x['proof_ledger']}, {x['walked']} hash links back"}}

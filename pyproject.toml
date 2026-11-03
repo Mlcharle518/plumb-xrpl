@@ -1,6 +1,6 @@
 [project]
 name = "plumb-xrpl"
-version = "0.1.0"
+version = "0.1.1"
 description = "XRP Ledger transactions and payments proven without trusting any server: pinned validator list -> quorum-signed ledger -> hash links -> rebuilt transaction tree."
 readme = "README.md"
 license = { text = "Apache-2.0" }

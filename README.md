@@ -40,6 +40,7 @@ plumb-xrpl tx  71100808DD3DF3EA693471FA...                       # any transacti
 plumb-xrpl pay 71100808... r9Y5...P2d --token RLUSD --min 50000   # was at least 0.05 RLUSD delivered to this account?
 plumb-xrpl pay 3A3915B2... rXXX --invoice C08EC114...             # ...and does the payment carry this InvoiceID?
 plumb-xrpl record                                                 # keep quorum proofs (see "How old can a payment be?")
+plumb-xrpl lists [--adopt FILE]                                   # validator lists the archive was recorded under
 plumb-xrpl serve                                                  # MCP server over stdio (extra: plumb-xrpl[mcp])
 ```
 
@@ -90,6 +91,12 @@ Validator signatures exist only live; rippled servers do not keep them. So a quo
 - **the proof archive**: `plumb-xrpl record` keeps one quorum-signed ledger per 256 ledgers (about every 16 minutes)
   in `~/.verified-reads/xrpl-proofs.jsonl` (override with `VR_XRPL_ARCHIVE`). Any older payment is then proven by hash
   links from the nearest archived proof. Run it as a service if you need to prove payments older than a few hours.
+  Beside the archive (`xrpl-proofs-lists/<seq>.json`) it keeps every validator-list document it recorded under. An
+  archived proof is checked against the list **in force when it was signed** (re-verified against the pinned
+  publisher, valid at that ledger's close time, not superseded by then), never against today's list, and the answer
+  names it (`xrpl.vl_seq`). Ripple publishes new lists from time to time; validations signed under the old one are
+  not forgeries. `plumb-xrpl lists` reports which lists the archive needs; `--adopt FILE` backfills a verifiable copy
+  (archives recorded with 0.1.0 named the list but did not keep it).
 
 A payment older than both is reported **unverifiable**, never guessed. The validator list is cached at
 `~/.verified-reads/xrpl-unl.json` (`VR_XRPL_UNL_CACHE`) and refreshed hourly.
